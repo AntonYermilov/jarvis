@@ -1,0 +1,11 @@
+python-telegram-bot
+yfinance
+numpy
+pandas
+requests
+tqdm
+pygsheets
+tinvest
+plotly
+kaleido
+pydantic
