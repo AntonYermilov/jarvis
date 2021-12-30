@@ -47,13 +47,14 @@ def invest_suggest(update: Update, context: CallbackContext):
     budget = int(context.args[0])
 
     try:
-        variants = []
+        media = []
         for i in range(10):
             suggestions = investments.suggest_shares(budget)
             suggestions.sort()
-            variants.append(', '.join(suggestions))
-        variants = '\n'.join(f'{i}. {suggestions}' for i, suggestions in enumerate(variants))
-        update.message.reply_text(variants)
+            ema_visualization = investments.visualize_ema(suggestions)
+            suggestions_text = ', '.join(suggestions)
+            media.append(telegram.InputMediaPhoto(media=ema_visualization, caption=f'{i}. {suggestions_text}'))
+        update.message.reply_media_group(media=media)
     except Exception as e:
         update.message.reply_text(f'<b>Error</b>: {e}', parse_mode=telegram.ParseMode.HTML)
 

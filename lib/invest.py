@@ -11,7 +11,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Union, List, Dict
+from typing import Optional, Union, List, Dict, Iterable
 from threading import Thread, RLock
 from math import ceil
 from tqdm import tqdm
@@ -58,24 +58,39 @@ class Investments:
         self._google_sa_config = google_sa_config
         self._history_path = history_path
         self._stocks = []
+        self._free_usd = 0.0
         self._expected_portfolio_cost = 5000.0
 
     @staticmethod
-    def _get_today_price(tickers: str, price_type: str = 'Close') -> Union[float, List[float]]:
-        tickers = tickers.replace('.', '-').split()
+    def _fix_tickers(tickers: str):
+        return tickers.replace('.', '-')
+
+    @staticmethod
+    def _get_historical_price(tickers: str, period: str, interval: str, price_type: str = 'Close') -> pd.DataFrame:
+        tickers = Investments._fix_tickers(tickers).split()
+
         prices = []
         for ticker in tickers:
-            if ticker in ['SPBE']:
-                continue
             while True:
                 try:
-                    info = yf.download(ticker, period='5d', progress=False, prepost=True, interval='1h', threads=False)
+                    info = yf.download(ticker, period=period, progress=False, prepost=True, interval=interval, threads=False)
+                    info = info[price_type]
                     break
                 except:
+                    logging.warning(f'Failed to fetch current price for {ticker}, retrying in 1 second')
                     time.sleep(1)
-            today_row = info.fillna(method='ffill').iloc[-1, :]
-            open_price = today_row[price_type]
-            prices.append(float(open_price))
+            prices.append(info)
+        result = pd.concat(prices, axis=1, join='outer')
+        result.columns = tickers
+        result = result.fillna(method='ffill').fillna(method='bfill').fillna(value=0.0)
+        return result
+
+    @staticmethod
+    def _get_today_price(tickers: str, price_type: str = 'Close') -> Union[float, List[float]]:
+        tickers = Investments._fix_tickers(tickers)
+        info = Investments._get_historical_price(tickers, period='5d', interval='1h', price_type=price_type)
+        today_row = info.iloc[-1, :]
+        prices = list(today_row)
         return prices[0] if len(prices) == 1 else prices
 
     @staticmethod
@@ -116,23 +131,54 @@ class Investments:
         )
         return client.get_portfolio().payload.positions
 
+    def _get_operations(self):
+        client = tinvest.SyncClient(
+            token=self._tinkoff_token
+        )
+        return client.get_operations(from_=datetime.fromtimestamp(0), to=datetime.utcnow()).payload.operations
+
+    def _get_total_buy_price(self):
+        operations = self._get_operations()
+        total_buy_price = 0.0
+        for operation in operations:
+            if operation.status != tinvest.OperationStatus.done:
+                continue
+
+            if operation.instrument_type == tinvest.InstrumentType.currency and operation.figi == 'BBG0013HGFT4':  # usd
+                if operation.operation_type in [tinvest.OperationType.buy, tinvest.OperationTypeWithCommission.buy]:
+                    total_buy_price += operation.quantity
+                if operation.operation_type in [tinvest.OperationType.sell, tinvest.OperationTypeWithCommission.sell]:
+                    total_buy_price -= operation.quantity
+                continue
+
+            if operation.currency == tinvest.Currency.usd and operation.operation_type == tinvest.OperationTypeWithCommission.pay_in:
+                total_buy_price += float(operation.payment)
+                continue
+        return total_buy_price
+
+    def _get_total_current_price(self):
+        return sum(stock.current_price * stock.my_lots for stock in self._stocks) + self._free_usd
+
     def update_stock_info(self):
-        positions = self._get_positions()
-        positions = list(filter(lambda pos: pos.instrument_type == tinvest.InstrumentType.stock and
-                                            pos.average_position_price.currency == tinvest.Currency.usd,
-                                positions))
+        all_positions = self._get_positions()
+        stock_positions = list(filter(lambda pos: pos.instrument_type == tinvest.InstrumentType.stock and
+                                                  pos.average_position_price.currency == tinvest.Currency.usd,
+                                      all_positions))
 
-        # tickers = ' '.join(pos.ticker for pos in positions)
-        # today_prices = self._get_today_price(tickers, price_type='Close')
-        today_prices = [float((pos.average_position_price.value * pos.lots + pos.expected_yield.value) / pos.lots) for pos in positions]
+        self._free_usd = 0.0
+        for pos in all_positions:
+            if pos.instrument_type == tinvest.InstrumentType.currency:
+                self._free_usd = float(pos.balance)
 
-        current_portfolio_cost = sum(pos.lots * price for pos, price in zip(positions, today_prices))
+        today_prices = [float((pos.average_position_price.value * pos.lots + pos.expected_yield.value) / pos.lots) for pos in stock_positions]
+
+        current_portfolio_cost = sum(pos.lots * price for pos, price in zip(stock_positions, today_prices))
         while self._expected_portfolio_cost < current_portfolio_cost:
             self._expected_portfolio_cost *= 1.5
         self._expected_portfolio_cost = ceil(self._expected_portfolio_cost / 5000.0) * 5000.0
 
         stocks = self._sample_sp100(self._expected_portfolio_cost)
-        for pos, price in tqdm(zip(positions, today_prices)):
+        for pos, price in tqdm(zip(stock_positions, today_prices)):
             if pos.ticker in stocks:
                 stocks[pos.ticker].my_lots = pos.lots
                 stocks[pos.ticker].avg_buy_price = float(pos.average_position_price.value)
@@ -157,7 +203,7 @@ class Investments:
         sh: pygsheets.Spreadsheet = gc.open('invest')
         wks: pygsheets.Worksheet = sh.sheet1
 
-        wks.clear()
+        wks.clear(fields='*')
 
         header: pygsheets.DataRange = wks.range('A1:E1', returnas='range')
         for cell in header.cells[0]:
@@ -187,24 +233,26 @@ class Investments:
             data.extend(row)
         wks.update_cells(data)
 
-        total_weight = sum(stock.total_price for stock in self._stocks)
-        total_yield = sum(stock.expected_yield for stock in self._stocks)
+        total_buy_price = self._get_total_buy_price()
+        total_current_price = self._get_total_current_price()
+        total_yield = total_current_price - total_buy_price
 
         info_cells = [
-            pygsheets.Cell(pos='H2', val=f'Portfolio cost:'),
-            pygsheets.Cell(pos='I2', val=total_weight),
-            pygsheets.Cell(pos='H3', val=f'Portfolio yield:'),
-            pygsheets.Cell(pos='I3', val=total_yield),
-            pygsheets.Cell(pos='H4', val=f'Target cost:'),
-            pygsheets.Cell(pos='I4', val=self._expected_portfolio_cost)
+            pygsheets.Cell(pos='H2', val=f'Portfolio buy price:'),
+            pygsheets.Cell(pos='I2', val=total_buy_price),
+            pygsheets.Cell(pos='H3', val=f'Portfolio current price:'),
+            pygsheets.Cell(pos='I3', val=total_current_price),
+            pygsheets.Cell(pos='H4', val=f'Portfolio yield:'),
+            pygsheets.Cell(pos='I4', val=total_yield),
+            pygsheets.Cell(pos='H5', val=f'Target price:'),
+            pygsheets.Cell(pos='I5', val=self._expected_portfolio_cost)
         ]
 
-        info_cells[0].set_text_format('bold', True)
-        info_cells[1].set_number_format(pygsheets.FormatType.NUMBER, pattern='0.0')
-        info_cells[2].set_text_format('bold', True)
-        info_cells[3].set_number_format(pygsheets.FormatType.NUMBER, pattern='0.0')
-        info_cells[4].set_text_format('bold', True)
-        info_cells[5].set_number_format(pygsheets.FormatType.NUMBER, pattern='0.0')
+        for i, cell in enumerate(info_cells):
+            if i % 2 == 0:
+                cell.set_text_format('bold', True)
+            else:
+                cell.set_number_format(pygsheets.FormatType.NUMBER, pattern='0.0')
 
         wks.update_cells(info_cells)
 
@@ -240,8 +288,8 @@ class Investments:
         return shares
 
     def update_history(self):
-        total_buy_price = sum(stock.avg_buy_price * stock.my_lots for stock in self._stocks if stock.my_lots > 0)
-        total_current_price = sum(stock.current_price * stock.my_lots for stock in self._stocks)
+        total_buy_price = self._get_total_buy_price()
+        total_current_price = self._get_total_current_price()
         today = datetime.today().strftime('%Y-%m-%dT%H:%M:%S')
 
         sp100_current_price = self._get_today_price('^OEX', 'Close')
@@ -250,6 +298,24 @@ class Investments:
 
         with Path(self._history_path).open('a') as fp:
             print(f'{today}\t{total_buy_price}\t{total_current_price}\t{sp100_current_price}', file=fp)
+
+    @staticmethod
+    def visualize_ema(tickers: List[str]):
+        tickers = list(map(Investments._fix_tickers, tickers))
+        unique_tickers = list(set(tickers))
+        prices = Investments._get_historical_price(' '.join(unique_tickers), period='3mo', interval='1h')
+        total_price = sum(prices[ticker] for ticker in tickers)
+
+        dates = [date.strftime('%Y-%m-%d %H:%M:%S') for date in prices.index]
+        ema_5d = total_price.ewm(span=16*5).mean()
+        ema_1mo = total_price.ewm(span=16*21).mean()
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=dates, y=total_price.to_numpy(), mode='lines', name='price'))
+        fig.add_trace(go.Scatter(x=dates, y=ema_5d.to_numpy(), mode='lines', name='ema_5d'))
+        fig.add_trace(go.Scatter(x=dates, y=ema_1mo.to_numpy(), mode='lines', name='ema_1mo'))
+        img = fig.to_image(format='png')
+        return img
 
     def visualize_history(self):
         df = pd.read_csv(self._history_path, sep='\t')
@@ -262,7 +328,7 @@ class Investments:
 
         coef, m = total_buy_price[0] / total_current_price[0], 1.0
         for i in range(1, len(portfolio)):
-            if total_buy_price[i] - total_buy_price[i - 1] > 100.0:
+            if abs(total_buy_price[i] - total_buy_price[i - 1]) > 1.0:
                 m *= (total_current_price[i - 1] / total_buy_price[i - 1]) / (total_current_price[i] / total_buy_price[i])
             portfolio[i] = total_current_price[i] / total_buy_price[i] * coef * m
             multiplier[i] = m
